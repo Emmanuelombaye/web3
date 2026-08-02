@@ -1,5 +1,4 @@
 node_modules/
-.env
 *.log
 data/
 .local-logs/
@@ -15,3 +14,4 @@ digitalocean
 # graphify tooling artifacts (knowledge-graph cache + scratch outputs)
 .graphify_*.json
 graphify-out/
+config.bat

@@ -13,8 +13,8 @@ const {
   mapWithConcurrency,
 } = require("./aaveHelpers");
 const { getSelectedChainConfigs } = require("./src/chains");
-const { getTransactionOverrides } = require("./src/gas");
-const { createProvider, createBlockProvider } = require("./src/provider");
+const { getTransactionOverrides, getFeeDataFast, getCachedBlockNumber } = require("./src/gas");
+const { createProvider, createRankedProvider, createBlockProvider } = require("./src/provider");
 const { loadHot } = require("./src/borrowerStore");
 const { NonceManager, maxInFlight } = require("./src/nonceManager");
 const { compactRevertReason } = require("./src/aaveErrorDecoder");
@@ -166,6 +166,40 @@ function normalizeLiquidationBaskets(position) {
   return baskets;
 }
 
+// Prefer the largest human-unit debt first (approx USD for USDC/USDT 6dp debt).
+// Raw BigNumber compare is wrong across mixed decimals (e.g. 1e18 WETH vs 1e6 USDC).
+function basketDebtScore(basket) {
+  try {
+    const decimals = Number.isFinite(basket.debtDecimals) ? basket.debtDecimals : 18;
+    return parseFloat(ethers.utils.formatUnits(basket.debtAmount, decimals));
+  } catch (_) {
+    return 0;
+  }
+}
+
+function sortBasketsByDebtDesc(baskets) {
+  return [...baskets].sort((a, b) => basketDebtScore(b) - basketDebtScore(a));
+}
+
+// Liquidatable candidates: biggest debt first, then lowest HF (most urgent).
+function sortLiquidationTargets(items) {
+  return [...items].sort((a, b) => {
+    const debtA = Number.isFinite(a.totalDebtUsd) ? a.totalDebtUsd : 0;
+    const debtB = Number.isFinite(b.totalDebtUsd) ? b.totalDebtUsd : 0;
+    if (debtB !== debtA) return debtB - debtA;
+    const hfA = Number.isFinite(a.healthFactor) ? a.healthFactor : Infinity;
+    const hfB = Number.isFinite(b.healthFactor) ? b.healthFactor : Infinity;
+    return hfA - hfB;
+  });
+}
+
+function envFlag(name, defaultTrue = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === "") return defaultTrue;
+  const v = String(raw).toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off" && v !== "no";
+}
+
 async function getOraclePriceCached(oracle, chainKey, asset) {
   const key = `${chainKey}:${String(asset).toLowerCase()}`;
   const cached = oraclePriceCache.get(key);
@@ -219,7 +253,8 @@ async function main() {
 }
 
 async function runChainBot(chainConfig) {
-  const provider = createProvider(chainConfig);
+  // Rank RPCs by RTT so the hot path hits the fastest endpoint first.
+  const provider = await createRankedProvider(chainConfig);
   const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
   const liquidatorAddress = getLiquidatorAddress(chainConfig);
   const aaveLiquidatorContract = liquidatorAddress
@@ -247,14 +282,13 @@ async function runChainBot(chainConfig) {
   // cheap enough to run frequently. The first cycle pays a one-time backfill.
   const cycleMs = parseInt(process.env.SCAN_INTERVAL_MS || "15000", 10);
 
-  // Event-driven triggers (Batch 1.1 + Phase 4). Both re-check ONLY the
-  // near-threshold watchlist (cheap), under the shared `lock`, so a position
-  // crossing HF<1 is acted on near-instantly instead of up to SCAN_INTERVAL_MS
-  // later. The slow poll below keeps maintaining the watchlist. A single WS
-  // provider (if a <CHAIN>_WS_URL is configured) is shared by both triggers so
-  // we open at most one socket per chain.
-  const wantBlockTrigger = process.env.BLOCK_TRIGGER === "true";
-  const wantPriceTrigger = process.env.PRICE_TRIGGER === "true" && !!chainConfig.collateralPriceFeed;
+  // Event-driven triggers. Both re-check ONLY the hot tier under the shared lock.
+  // PRICE_TRIGGER defaults ON when a Chainlink collateral feed is configured —
+  // price drops are what push HF under 1; reacting same-update beats waiting for
+  // the next poll. BLOCK_TRIGGER stays explicit (needs WS to be worth the load).
+  const wantBlockTrigger = envFlag("BLOCK_TRIGGER", false);
+  const wantPriceTrigger =
+    envFlag("PRICE_TRIGGER", true) && !!chainConfig.collateralPriceFeed;
   const eventProvider =
     wantBlockTrigger || wantPriceTrigger ? createBlockProvider(chainConfig) || provider : null;
   const usingWs = eventProvider && eventProvider !== provider;
@@ -280,38 +314,56 @@ async function runChainBot(chainConfig) {
     eventProvider.on("block", (blockNumber) => triggerWatchlistCheck(`block-trigger (block ${blockNumber})`, blockNumber));
   }
 
-  // Phase 4 — Chainlink price-update trigger. The Aave oracle source for the
-  // volatile collateral (ETH/AVAX/XPL /USD) is a Chainlink proxy; its underlying
-  // aggregator emits AnswerUpdated when the price moves — which is the actual
-  // cause of an HF dropping below 1. Reacting to that event (rather than only the
-  // next block tick) shaves latency and tells us a price just moved, so we
-  // re-check the watchlist immediately. WS push where available (free on Alchemy);
-  // Plasma (no WS) leans on its per-block trigger instead — we skip the price
-  // subscription there since a WS-less aggregator poll would just duplicate it.
+  // Phase 4 — Chainlink price-update trigger. Prefer WS AnswerUpdated push; if
+  // no WS, poll latestRoundData on each new HTTP block and fire when the answer
+  // changes (still same-block detection during crashes, without a socket).
   if (wantPriceTrigger) {
-    if (!usingWs) {
-      console.log(`📈 ${chainConfig.name}: PRICE_TRIGGER requested but no WS endpoint — relying on per-block trigger instead (no separate price subscription).`);
-    } else {
-      try {
-        // The proxy address is stable; resolve the current underlying aggregator
-        // (the contract that actually emits AnswerUpdated) at startup.
-        const proxy = new ethers.Contract(
-          chainConfig.collateralPriceFeed,
-          ["function aggregator() view returns (address)", "function description() view returns (string)"],
-          eventProvider
-        );
-        const aggregatorAddr = await proxy.aggregator();
-        let desc = "";
-        try { desc = await proxy.description(); } catch (_) {}
-        const ANSWER_UPDATED = "event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt)";
+    const ANSWER_UPDATED = "event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt)";
+    const LATEST_ROUND = "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)";
+    try {
+      const proxy = new ethers.Contract(
+        chainConfig.collateralPriceFeed,
+        ["function aggregator() view returns (address)", "function description() view returns (string)", LATEST_ROUND],
+        eventProvider || provider
+      );
+      const aggregatorAddr = await proxy.aggregator();
+      let desc = "";
+      try { desc = await proxy.description(); } catch (_) {}
+
+      if (usingWs) {
         const aggregator = new ethers.Contract(aggregatorAddr, [ANSWER_UPDATED], eventProvider);
         console.log(`📈 ${chainConfig.name}: price-update trigger ON (Chainlink ${desc || "feed"} ${aggregatorAddr}, WebSocket push).`);
         aggregator.on("AnswerUpdated", (current, roundId) =>
           triggerWatchlistCheck(`price-trigger (round ${roundId?.toString?.() || "?"})`, undefined)
         );
-      } catch (error) {
-        console.error(`❌ ${chainConfig.name}: failed to set up price trigger:`, error.message);
+      } else {
+        // HTTP poll fallback: watch block headers on the HTTP provider and
+        // re-check the feed; fire hot-tier scan only when the answer moves.
+        let lastAnswer = null;
+        try {
+          const round = await proxy.latestRoundData();
+          lastAnswer = round.answer.toString();
+        } catch (_) {}
+        console.log(
+          `📈 ${chainConfig.name}: price-update trigger ON (Chainlink ${desc || "feed"} ${aggregatorAddr}, HTTP poll on new blocks — set <CHAIN>_WS_URL for push).`
+        );
+        provider.on("block", async (blockNumber) => {
+          try {
+            const round = await proxy.latestRoundData();
+            const answer = round.answer.toString();
+            if (lastAnswer != null && answer !== lastAnswer) {
+              lastAnswer = answer;
+              triggerWatchlistCheck(`price-trigger-poll (block ${blockNumber})`, blockNumber);
+            } else if (lastAnswer == null) {
+              lastAnswer = answer;
+            }
+          } catch (_) {
+            // Non-fatal: feed read failed this block.
+          }
+        });
       }
+    } catch (error) {
+      console.error(`❌ ${chainConfig.name}: failed to set up price trigger:`, error.message);
     }
   }
 
@@ -326,9 +378,10 @@ async function runChainBot(chainConfig) {
     lock.inFlight = true;
     try {
       const opportunities = await getUnhealthyPositions(provider, chainConfig);
-      console.log(`📌 ${chainConfig.name}: Found ${opportunities.length} liquidatable positions (cycle ${Date.now() - cycleStart}ms).`);
+      const ordered = sortLiquidationTargets(opportunities);
+      console.log(`📌 ${chainConfig.name}: Found ${ordered.length} liquidatable positions (cycle ${Date.now() - cycleStart}ms).`);
 
-      for (const position of opportunities) {
+      for (const position of ordered) {
         await attemptLiquidation(position, ctx);
       }
     } catch (error) {
@@ -362,9 +415,9 @@ async function runWatchlistCheck({ provider, chainConfig, aaveLiquidatorContract
 
   const t0 = Date.now();
   const hfs = await getUserHealthFactorsBatched([...hot], provider, chainConfig);
-  const liq = hfs
-    .filter((h) => Number.isFinite(h.healthFactor) && h.healthFactor < threshold && h.totalDebtUsd >= minDebtUsd)
-    .sort((a, b) => a.healthFactor - b.healthFactor);
+  const liq = sortLiquidationTargets(
+    hfs.filter((h) => Number.isFinite(h.healthFactor) && h.healthFactor < threshold && h.totalDebtUsd >= minDebtUsd)
+  );
   const scanMs = Date.now() - t0;
   if (shouldLogTriggerScan(chainKey, liq.length > 0)) {
     metrics.emit("trigger_scan", {
@@ -410,7 +463,7 @@ async function runWatchlistCheck({ provider, chainConfig, aaveLiquidatorContract
     return { ...position, user, healthFactor, totalDebtUsd };
   });
 
-  for (const position of enriched.filter(Boolean)) {
+  for (const position of sortLiquidationTargets(enriched.filter(Boolean))) {
     await attemptLiquidation(
       position,
       { provider, chainConfig, aaveLiquidatorContract, nonceManager }
@@ -603,7 +656,11 @@ async function attemptLiquidation(position, {
   nonceManager,
 }) {
   const { user, healthFactor } = position;
-  const candidateBaskets = normalizeLiquidationBaskets(position);
+
+  // Sort baskets by descending human-unit debt (not raw wei — mixed decimals
+  // would mis-order USDC vs WETH). Largest debt ≈ largest bonus ≈ try first.
+  const candidateBaskets = sortBasketsByDebtDesc(normalizeLiquidationBaskets(position));
+
   const primaryBasket = candidateBaskets[0];
   if (!primaryBasket) {
     console.warn(`${chainConfig.name}: No liquidation basket available for ${user}; skipping.`);
@@ -675,25 +732,16 @@ async function attemptLiquidation(position, {
     return;
   }
 
-  // METRICS: start the "decide" stopwatch (enrich is already done by the caller;
-  // this times sim + floor + send-prep up to broadcast) and record the block we're
-  // acting at, so block-lag (detect→send) is visible per attempt.
+  // METRICS: decide stopwatch. Fee+block from ONE fast cached read (not
+  // getFeeData's multi-RPC + separate getBlockNumber).
   const decideT0 = metrics.now();
-  let detectBlock = null;
-  try { detectBlock = await provider.getBlockNumber(); } catch (_) {}
-
-  // Fetch the live fee data ONCE for the whole submit path (gas was previously
-  // fetched up to three times). getFeeData gives us both the legacy gasPrice (for
-  // the cost math in computeMinProfitUnits) AND the EIP-1559 fields (base + tip)
-  // that getTransactionOverrides uses to bid on inclusion priority (3.1). Thread
-  // both through. Non-fatal if it fails — downstream falls back to a fresh read.
   let sharedFeeData = null;
   let sharedGasPrice = null;
+  let detectBlock = null;
   try {
-    sharedFeeData = await provider.getFeeData();
-    // Effective gas price for cost estimation: prefer the 1559 ceiling we'd
-    // actually pay up to (maxFeePerGas), else the legacy gasPrice.
+    sharedFeeData = await getFeeDataFast(provider, chainConfig);
     sharedGasPrice = sharedFeeData.maxFeePerGas || sharedFeeData.gasPrice || null;
+    detectBlock = getCachedBlockNumber(provider, chainConfig);
   } catch (_) {
     // leave null; helpers will fetch their own.
   }
@@ -727,24 +775,22 @@ async function attemptLiquidation(position, {
       continue;
     }
 
-    // Resolve the V3 swap path off-chain (3.3) for this exact collateral→debt
-    // basket. "0x" / failure => contract self-resolves, so this never regresses.
-    let basketSwapPath = "0x";
-    if (chainConfig.pathAware && collateralAsset.toLowerCase() !== debtAsset.toLowerCase()) {
-      try {
-        basketSwapPath = await resolveSwapPath(provider, chainConfig, collateralAsset, debtAsset);
-      } catch (_) {
-        basketSwapPath = "0x";
-      }
-    }
-
-    const basketMinProfitUnits = await computeMinProfitUnits({
-      provider,
-      chainConfig,
-      debtDecimals,
-      estGasUnits: ethers.BigNumber.from(chainConfig.liquidationGasLimit),
-      gasPrice: precheckGasPrice,
-    });
+    // Path resolve + min-profit floor in PARALLEL (was sequential ≈ 2 RTT).
+    const needPath =
+      chainConfig.pathAware &&
+      collateralAsset.toLowerCase() !== debtAsset.toLowerCase();
+    const [basketSwapPath, basketMinProfitUnits] = await Promise.all([
+      needPath
+        ? resolveSwapPath(provider, chainConfig, collateralAsset, debtAsset).catch(() => "0x")
+        : Promise.resolve("0x"),
+      computeMinProfitUnits({
+        provider,
+        chainConfig,
+        debtDecimals,
+        estGasUnits: ethers.BigNumber.from(chainConfig.liquidationGasLimit),
+        gasPrice: precheckGasPrice,
+      }),
+    ]);
 
     const variant = await selectLiquidationVariant({
       contract: aaveLiquidatorContract,
@@ -845,11 +891,79 @@ async function attemptLiquidation(position, {
   }
 
   try {
+    // HF guard + profit estimate in PARALLEL (was sequential RPCs before sign).
+    const minDebtUsd = resolveChainMinDebtUsd(chainConfig);
+    const [guardResult, estimatedProfitNative] = await Promise.all([
+      (async () => {
+        try {
+          const [freshHfEntry] = await getUserHealthFactorsBatched([user], provider, chainConfig);
+          if (freshHfEntry && Number.isFinite(freshHfEntry.healthFactor)) {
+            if (freshHfEntry.healthFactor >= 1.0) {
+              return { skip: true, outcome: "guard_healed", hf: freshHfEntry.healthFactor };
+            }
+            if (Number.isFinite(freshHfEntry.totalDebtUsd) && freshHfEntry.totalDebtUsd < minDebtUsd) {
+              return { skip: true, outcome: "guard_dust", hf: freshHfEntry.healthFactor, debt: freshHfEntry.totalDebtUsd };
+            }
+          }
+        } catch (_) {}
+        return { skip: false };
+      })(),
+      (async () => {
+        try {
+          if (!(chainConfig.priceOracle && chainConfig.wrappedNative && selected.debtDecimals != null)) {
+            return null;
+          }
+          const bonusFraction = parseFloat(process.env.LIQUIDATION_BONUS_FRACTION || "0.05");
+          const fractionX10000 = Math.round(Math.max(0, Math.min(bonusFraction, 1)) * 10000);
+          const bonusUnits = debtToCover.mul(fractionX10000).div(10000);
+          const oracle = new ethers.Contract(chainConfig.priceOracle, AAVE_ORACLE_ABI, provider);
+          const chainKey = chainConfig.key || "default";
+          const debtPriceAsset = debtAsset || chainConfig.debtAssetAddress;
+          const [nativeUsd, debtUsd] = await Promise.all([
+            getOraclePriceCached(oracle, chainKey, chainConfig.wrappedNative),
+            getOraclePriceCached(oracle, chainKey, debtPriceAsset),
+          ]);
+          if (debtUsd.isZero() || nativeUsd.isZero()) return null;
+          const tenPowDebt = ethers.BigNumber.from(10).pow(selected.debtDecimals);
+          return bonusUnits
+            .mul(debtUsd)
+            .mul(ethers.constants.WeiPerEther)
+            .div(tenPowDebt)
+            .div(nativeUsd);
+        } catch (_) {
+          return null;
+        }
+      })(),
+    ]);
+
+    if (guardResult.skip) {
+      if (guardResult.outcome === "guard_healed") {
+        console.log(`⏭️ ${chainConfig.name}: double-check HF guard: ${user} healed to ${guardResult.hf.toFixed(4)} since callStatic — skipping.`);
+      } else {
+        console.log(`⏭️ ${chainConfig.name}: double-check HF guard: ${user} debt $${Number(guardResult.debt).toFixed(2)} < $${minDebtUsd} — skipping.`);
+      }
+      metrics.emit("attempt", {
+        chain: chainConfig.key, user, hf: guardResult.hf,
+        outcome: guardResult.outcome, decideMs: metrics.since(decideT0), detectBlock,
+      });
+      return;
+    }
+
     const overrides = await getTransactionOverrides(provider, chainConfig, {
       gasLimit: chainConfig.liquidationGasLimit,
-      feeData: sharedFeeData,   // EIP-1559 bid (3.1); helper falls back to legacy if absent
-      gasPrice: sharedGasPrice, // legacy fallback; reuse the single fetch
+      feeData: sharedFeeData,
+      gasPrice: sharedGasPrice,
+      estimatedProfitNative,
     });
+    if (overrides.maxPriorityFeePerGas && estimatedProfitNative) {
+      const gasLim = ethers.BigNumber.from(overrides.gasLimit || chainConfig.liquidationGasLimit || 2_000_000);
+      const totalTip = overrides.maxPriorityFeePerGas.mul(gasLim);
+      console.log(
+        `💰 ${chainConfig.name}: profit-guided tip ${ethers.utils.formatUnits(overrides.maxPriorityFeePerGas, "gwei")} gwei/gas` +
+        ` (budget≈${ethers.utils.formatEther(totalTip)} ${chainConfig.nativeToken}` +
+        `, est profit ~${ethers.utils.formatEther(estimatedProfitNative)} ${chainConfig.nativeToken})`
+      );
+    }
 
     // Reserve a nonce locally (3.2) so we don't round-trip getTransactionCount on
     // the hot path and so concurrent sends to same-block targets get distinct

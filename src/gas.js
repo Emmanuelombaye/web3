@@ -1,7 +1,6 @@
 const { ethers } = require("ethers");
 
 // Per-chain numeric env resolver: <CHAIN>_<NAME> → <NAME> → fallback.
-// Mirrors resolveChainMinDebtUsd so gas knobs can be tuned per chain.
 function resolveChainNum(chainConfig, name, fallback) {
   const key = (chainConfig.key || "").toUpperCase();
   const candidates = [key ? process.env[`${key}_${name}`] : undefined, process.env[name]];
@@ -13,55 +12,170 @@ function resolveChainNum(chainConfig, name, fallback) {
   return fallback;
 }
 
-// Builds the tx overrides for a liquidation. Prefers EIP-1559
-// (maxFeePerGas / maxPriorityFeePerGas) so we can outbid competitors on
-// INCLUSION PRIORITY when our tx and theirs target the same position in the same
-// block — a flat legacy gasPrice can't win that auction. Falls back to legacy
-// gasPrice on chains/RPCs that don't expose a 1559 fee market.
-//
-// PRIORITY FEE is driven by the BASE FEE (the real congestion signal on these
-// L2s), NOT the node's suggested tip — every node here returns a flat ~1.5 gwei
-// "suggestion" regardless of load, so tip×mult overpaid ~2.25 gwei on a ~0.01–0.28
-// gwei base fee. Instead:
-//   priorityFee = clamp(baseFee × PRIORITY_FEE_MULTIPLE,
-//                       floor MIN_PRIORITY_FEE_GWEI, cap MAX_PRIORITY_FEE_GWEI) + bump
-// so the tip scales with congestion, collapses to a small floor when the chain is
-// quiet (still out-tipping lazy bots), and can't exceed the cap on a base-fee
-// spike. maxFeePerGas = baseFee × BASE_FEE_MULTIPLE + priorityFee (headroom for
-// base climbing over the next blocks). Overpaying to win is fine on a profitable
-// liquidation — the minProfit floor budgets PROFIT_SAFETY_MULTIPLE × gas and the
-// callStatic gate reverts unprofitable txs — but we no longer overpay needlessly.
-// All four knobs are per-chain overridable (<CHAIN>_PRIORITY_FEE_MULTIPLE, etc.).
-//
-// options.feeData  — pre-fetched provider.getFeeData() (avoids a round-trip on
-//                    the hot path; 2.1 fetches it once and threads it through).
-// options.gasPrice — legacy fallback gas price (BigNumber) if feeData is absent.
-// options.legacy   — force legacy gasPrice mode (e.g. a chain that misreports 1559).
+function gweiToWei(gwei) {
+  const fixed = Number(gwei).toFixed(9);
+  return ethers.utils.parseUnits(fixed, "gwei");
+}
+
+async function safeFeeData(provider) {
+  try {
+    return await getFeeDataFast(provider);
+  } catch (_) {
+    return null;
+  }
+}
+
+// Fast fee read: ONE getBlock("latest") for baseFee (+ block number) and
+// gasPrice in parallel. ethers.provider.getFeeData() often issues 2–3 sequential
+// RPCs (~900ms on public endpoints). Cache briefly so burst attempts reuse it.
+const feeDataCache = new Map(); // key -> { at, feeData, blockNumber }
+
+function feeCacheKey(provider, chainConfig) {
+  return (chainConfig && chainConfig.key) || provider?.connection?.url || "default";
+}
+
+function feeDataTtlMs() {
+  const n = parseInt(process.env.FEE_DATA_TTL_MS || "1500", 10);
+  return Number.isFinite(n) && n >= 0 ? n : 1500;
+}
+
+async function getFeeDataFast(provider, chainConfig = {}) {
+  const key = feeCacheKey(provider, chainConfig);
+  const ttl = feeDataTtlMs();
+  const hit = feeDataCache.get(key);
+  if (ttl > 0 && hit && Date.now() - hit.at < ttl) {
+    return hit.feeData;
+  }
+
+  // ONE RPC: latest block carries baseFeePerGas on all our L2s. Skipping a
+  // parallel eth_gasPrice halves the fee-read latency (was ~900ms on public RPCs).
+  const block = await provider.getBlock("latest");
+  const baseFee = block && block.baseFeePerGas ? block.baseFeePerGas : null;
+  const feeData = {
+    gasPrice: baseFee || null,
+    lastBaseFeePerGas: baseFee,
+    maxFeePerGas: baseFee ? baseFee.mul(2) : null,
+    maxPriorityFeePerGas: null,
+  };
+
+  feeDataCache.set(key, {
+    at: Date.now(),
+    feeData,
+    blockNumber: block && block.number != null ? block.number : null,
+  });
+  return feeData;
+}
+
+function getCachedBlockNumber(provider, chainConfig = {}) {
+  const hit = feeDataCache.get(feeCacheKey(provider, chainConfig));
+  return hit && hit.blockNumber != null ? hit.blockNumber : null;
+}
+
+/**
+ * Compute EIP-1559 priority fee (per gas) for a liquidation.
+ *
+ * Winning contested L2 races needs BOTH:
+ *   - congestion tip (scales with base fee)
+ *   - opportunity tip (spend a fraction of estimated profit on inclusion)
+ *
+ * Opportunity tip is a TOTAL tip budget (profit × fraction), converted to
+ * per-gas: budget / gasLimit. Treating profit×fraction as per-gas would
+ * overpay by ~gasLimit× and bankrupt the wallet.
+ *
+ * priorityFee = max(congestionTip, opportunityTipPerGas)
+ * then clamped so total tip (fee × gasLimit) never exceeds
+ * profit × PROFIT_TIP_MAX_FRACTION (default 10%).
+ */
+function computePriorityFeeWei(chainConfig, {
+  baseFee,
+  bump,
+  estimatedProfitNative,
+  gasLimit,
+} = {}) {
+  const priorityMult = resolveChainNum(chainConfig, "PRIORITY_FEE_MULTIPLE", 3);
+  const floorTip = gweiToWei(resolveChainNum(chainConfig, "MIN_PRIORITY_FEE_GWEI", 0.05));
+  const staticCap = gweiToWei(resolveChainNum(chainConfig, "MAX_PRIORITY_FEE_GWEI", 2.25));
+  const bumpWei = bump && ethers.BigNumber.isBigNumber(bump) ? bump : ethers.constants.Zero;
+  const gasLimitBn = ethers.BigNumber.from(
+    gasLimit || chainConfig.liquidationGasLimit || 2_000_000
+  );
+
+  // Congestion component: baseFee × multiple, floored.
+  let congestionTip = baseFee.mul(Math.round(priorityMult * 100)).div(100);
+  if (congestionTip.lt(floorTip)) congestionTip = floorTip;
+
+  // Opportunity component: bid a fraction of estimated profit as TOTAL tip budget,
+  // then convert to per-gas for the EIP-1559 field.
+  const profitGuidedEnabled = (process.env.PROFIT_GUIDED_TIP || "true") !== "false";
+  let opportunityTip = ethers.constants.Zero;
+  let profitWei = null;
+
+  if (profitGuidedEnabled && estimatedProfitNative) {
+    try {
+      profitWei = ethers.BigNumber.isBigNumber(estimatedProfitNative)
+        ? estimatedProfitNative
+        : ethers.utils.parseEther(String(estimatedProfitNative));
+      if (profitWei.gt(0) && gasLimitBn.gt(0)) {
+        const tipFractionX1000 = Math.round(
+          parseFloat(process.env.PROFIT_TIP_FRACTION || "0.01") * 1000
+        ); // default 1% of estimated bonus as TOTAL tip budget
+        const tipBudget = profitWei.mul(Math.max(tipFractionX1000, 0)).div(1000);
+        opportunityTip = tipBudget.div(gasLimitBn);
+      }
+    } catch (_) {
+      profitWei = null;
+      opportunityTip = ethers.constants.Zero;
+    }
+  }
+
+  // Take the stronger of congestion vs opportunity (per gas).
+  let priorityFee = congestionTip.gte(opportunityTip) ? congestionTip : opportunityTip;
+
+  // Hard ceiling on TOTAL tip paid ≈ priorityFee × gasLimit.
+  if (profitWei && profitWei.gt(0) && gasLimitBn.gt(0)) {
+    const maxFracX1000 = Math.round(
+      parseFloat(process.env.PROFIT_TIP_MAX_FRACTION || "0.10") * 1000
+    ); // default 10% of profit
+    const maxBudget = profitWei.mul(Math.max(maxFracX1000, 0)).div(1000);
+    const profitPerGasCap = maxBudget.div(gasLimitBn);
+    // Allow opportunity bidding above the static gwei cap, but never above the
+    // profit-derived per-gas cap. Also never below needing the static cap when
+    // profit signal is tiny.
+    const effectiveCap = profitPerGasCap.gt(staticCap) ? profitPerGasCap : staticCap;
+    if (priorityFee.gt(effectiveCap)) priorityFee = effectiveCap;
+    if (priorityFee.gt(profitPerGasCap) && profitPerGasCap.gt(0)) {
+      priorityFee = profitPerGasCap;
+    }
+  } else if (staticCap.gt(0) && priorityFee.gt(staticCap)) {
+    priorityFee = staticCap;
+  }
+
+  if (priorityFee.lt(floorTip)) priorityFee = floorTip;
+  return priorityFee.add(bumpWei);
+}
+
+// Builds the tx overrides for a liquidation. Prefers EIP-1559.
 async function getTransactionOverrides(provider, chainConfig, options = {}) {
   const gasLimit = options.gasLimit || chainConfig.liquidationGasLimit;
   const bumpGwei = chainConfig.gasPriceBumpGwei || "0";
   const bump = ethers.utils.parseUnits(bumpGwei, "gwei");
 
   const forceLegacy = options.legacy === true || chainConfig.forceLegacyGas === true;
-  const feeData = options.feeData || (forceLegacy ? null : await safeFeeData(provider));
+  const feeData =
+    options.feeData ||
+    (forceLegacy ? null : await getFeeDataFast(provider, chainConfig));
 
-  // EIP-1559 path: requires a base fee (lastBaseFeePerGas) AND a 1559-style
-  // maxFeePerGas from the node. If either is missing, fall back to legacy.
   const baseFee = feeData && feeData.lastBaseFeePerGas;
   const supports1559 = !forceLegacy && feeData && feeData.maxFeePerGas && baseFee;
 
   if (supports1559) {
-    const priorityMult = resolveChainNum(chainConfig, "PRIORITY_FEE_MULTIPLE", 3); // × base fee
     const baseMultX100 = Math.round(resolveChainNum(chainConfig, "BASE_FEE_MULTIPLE", 2) * 100);
-    const floorTip = gweiToWei(resolveChainNum(chainConfig, "MIN_PRIORITY_FEE_GWEI", 0.05));
-    const capTip = gweiToWei(resolveChainNum(chainConfig, "MAX_PRIORITY_FEE_GWEI", 2.25));
-
-    // Base-fee-driven tip, clamped to [floor, cap], plus any per-chain bump.
-    let priorityFee = baseFee.mul(Math.round(priorityMult * 100)).div(100);
-    if (priorityFee.lt(floorTip)) priorityFee = floorTip;
-    if (capTip.gt(0) && priorityFee.gt(capTip)) priorityFee = capTip;
-    priorityFee = priorityFee.add(bump);
-
+    const priorityFee = computePriorityFeeWei(chainConfig, {
+      baseFee,
+      bump,
+      estimatedProfitNative: options.estimatedProfitNative,
+      gasLimit,
+    });
     const maxFeePerGas = baseFee.mul(baseMultX100).div(100).add(priorityFee);
 
     return {
@@ -71,28 +185,11 @@ async function getTransactionOverrides(provider, chainConfig, options = {}) {
     };
   }
 
-  // Legacy fallback.
   const gasPrice = options.gasPrice || (feeData && feeData.gasPrice) || (await provider.getGasPrice());
   return {
     gasLimit,
     gasPrice: gasPrice.add(bump),
   };
-}
-
-// Parse a gwei float (e.g. 0.05) to a wei BigNumber, tolerating sub-gwei values.
-function gweiToWei(gwei) {
-  // parseUnits needs a string; clamp to 9 decimals (1 gwei = 1e9 wei).
-  const fixed = Number(gwei).toFixed(9);
-  return ethers.utils.parseUnits(fixed, "gwei");
-}
-
-// getFeeData can throw on flaky RPCs; never let that sink the submit path.
-async function safeFeeData(provider) {
-  try {
-    return await provider.getFeeData();
-  } catch (_) {
-    return null;
-  }
 }
 
 async function getGasSnapshot(provider, chainConfig) {
@@ -131,4 +228,8 @@ async function getGasSnapshot(provider, chainConfig) {
 module.exports = {
   getGasSnapshot,
   getTransactionOverrides,
+  computePriorityFeeWei,
+  resolveChainNum,
+  getFeeDataFast,
+  getCachedBlockNumber,
 };

@@ -13,6 +13,11 @@
     "monitor:test": "npm test --prefix monitor",
     "test:aave-errors": "node scripts/testAaveErrorDecode.js",
     "test:backfill-metadata": "node scripts/testBackfillMetadata.js",
+    "test:live-catch": "node scripts/testLiveCatchClassify.js",
+    "test:profit-tip": "node scripts/testProfitGuidedTip.js",
+    "test:win-sort": "node scripts/testWinPipelineSort.js",
+    "speed": "node scripts/speedBench.js",
+    "live-catch": "node scripts/liveCatchDetection.js",
     "test": "npm run smoke:chains"
   },
   "keywords": [],
